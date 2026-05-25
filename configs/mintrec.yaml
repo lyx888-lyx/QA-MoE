@@ -1,0 +1,93 @@
+# === MIntRec Config ===
+
+# Data
+
+dataset: "MIntRec"
+data_path: "../../data/ytzhu/MIntRec/MIA-datasets/"     # 数据所在目录（audio_feats.pkl、video_feats_fixed.pkl、tsv）
+# =========================
+#   Basic Settings
+# =========================
+seed: 42
+device: "cuda"
+drop_rates: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+# dataloader
+train_batch_size: 8
+eval_batch_size: 8
+num_workers: 4
+
+data_mode: "binary-class"
+logger_name: "Multimodal Intent Recognition"
+
+# paths inside dataset folder
+text_backbone: "bert-base-uncased"
+
+# unimodal feature file names
+audio_data_path: "."        # 同目录
+audio_feats_path: "audio_feats.pkl"
+
+video_data_path: "."
+video_feats_path: "video_feats.pkl"
+
+padding_mode: "zero"
+padding_loc: "end"
+
+# =========================
+#   Training
+# =========================
+epochs: 30
+lr: 0.0001
+weight_decay: 0.00001
+
+# Setting for the scheduler
+scheduler_patience: 3
+scheduler_factor: 0.5
+
+# =========================
+#   Model Structure
+# =========================
+num_labels: 20
+finetune_bert: true 
+hidden_dim: 128          # each encoder output dim
+num_experts: 16            # total experts
+top_k: 6             # full soft mixture for now
+use_quality: true         # enable modality quality gating
+
+# =========================
+#   Transformer Expert
+# =========================
+transformer_hidden_dim: 256
+num_heads: 4
+num_layers: 2
+
+# =========================
+#   Input Dimensions (modify according to your MOSI features)
+# =========================
+text_input_dim: 768       # GloVe or BERT-derived
+audio_input_dim: 768       # COVAREP
+vision_input_dim: 256      # FACET
+
+# =========================
+#   Loss Settings
+# =========================
+use_contrastive: true
+contrastive_freeze_epoch: 5
+
+# main multitask loss weights
+reg_weight: 1.0
+cls_weight: 1.0
+contrastive_weight: 0.05
+
+# =========================
+#   MoE Regularization
+# =========================
+entropy_weight: 0.1
+load_balance_weight: 0.01
+
+# =========================
+#   Logging & Checkpoint
+# =========================
+log_path: "./logs/train.log"
+ckpt_path: "./checkpoints/best_model.pth"
+
+
