@@ -90,6 +90,9 @@ def main():
     if args.batch_size < 1 or args.epochs < 1:
         raise ValueError("batch-size and epochs must be positive")
     seed_everything(args.seed)
+    if args.max_steps:
+        print(f"WARNING: --max-steps={args.max_steps} truncates every training epoch; results are NOT comparable with the paper.")
+    print("TRAIN FLAGS:", json.dumps({k:v for k,v in vars(args).items() if k not in ("bert_path", "data")}, ensure_ascii=False))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.amp and device.type != "cuda":
         raise ValueError("--amp requires CUDA")
@@ -155,7 +158,8 @@ def main():
                 peak = round(torch.cuda.max_memory_allocated() / 1024**3, 2) if device.type == "cuda" else None
                 log = {"epoch":epoch+1, "train_NLL":round(total/max(steps,1),5),
                        "validation":validation, "peak_gpu_GiB":peak,
-                       "seconds":round(time.monotonic()-start,1)}
+                       "seconds":round(time.monotonic()-start,1), "train_steps":steps,
+                       "expected_steps":len(loaders["train"]), "max_steps":args.max_steps}
                 history.write(json.dumps(log, ensure_ascii=False) + "\n")
                 history.flush()
                 print(json.dumps(log, ensure_ascii=False))
