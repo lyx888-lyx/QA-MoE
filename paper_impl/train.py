@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from torch.nn import functional as F
 from .data import AlignedSentimentDataset, corrupt_batch, resolve_data
 from .metrics import compute
 from .model import PaperQAMoE
@@ -32,6 +33,14 @@ def arguments():
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=1111)
     p.add_argument("--amp", action="store_true")
+    p.add_argument("--logvar-floor", type=float, default=None,
+                   help="Experimental: smooth log variance lower bound; e.g. -1.0")
+    p.add_argument("--aux-huber-weight", type=float, default=0.0,
+                   help="Experimental Huber auxiliary regression loss")
+    p.add_argument("--router-balance-weight", type=float, default=0.0,
+                   help="Experimental soft router batch-balance penalty")
+    p.add_argument("--skip-test-after-training", action="store_true",
+                   help="Keep final test set untouched while tuning on validation")
     p.add_argument("--freeze-bert", action="store_true",
                    help="Resource-saving deviation from the paper")
     p.add_argument("--max-steps", type=int, default=0,
@@ -89,6 +98,19 @@ def main():
     args = arguments()
     if args.batch_size < 1 or args.epochs < 1:
         raise ValueError("batch-size and epochs must be positive")
+    if args.aux_huber_weight < 0 or args.router_balance_weight < 0:
+        raise ValueError("Experimental loss weights must be nonnegative")
+    if args.logvar_floor is not None and not (-10.0 < args.logvar_floor <= 3.0):
+        raise ValueError("logvar-floor must be between -10 and 3")
+    if args.mode == "eval":
+        if not args.checkpoint:
+            raise ValueError("--mode eval requires --checkpoint")
+        metadata = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        saved_options = metadata.get("args", {})
+        saved_floor = saved_options.get("logvar_floor")
+        if args.logvar_floor is not None and args.logvar_floor != saved_floor:
+            raise ValueError("Requested --logvar-floor differs from the saved checkpoint")
+        args.logvar_floor = saved_floor
     seed_everything(args.seed)
     if args.max_steps:
         print(f"WARNING: --max-steps={args.max_steps} truncates every training epoch; results are NOT comparable with the paper.")
@@ -110,7 +132,8 @@ def main():
     ds = datasets["train"]
     print(f"Audio dim={ds.audio.shape[-1]}, vision dim={ds.vision.shape[-1]}, original label range={ds.labels.min():.2f}..{ds.labels.max():.2f}")
     model = PaperQAMoE(args.bert_path, ds.audio.shape[-1], ds.vision.shape[-1],
-                       args.hidden, args.experts, args.top_k).to(device)
+                       args.hidden, args.experts, args.top_k,
+                       logvar_floor=args.logvar_floor).to(device)
     if args.freeze_bert:
         for p in model.bert.parameters():
             p.requires_grad_(False)
@@ -133,6 +156,9 @@ def main():
                 model.train()
                 start = time.monotonic()
                 total = 0.0
+                nll_total = 0.0
+                huber_total = 0.0
+                balance_total = 0.0
                 steps = 0
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats()
@@ -141,7 +167,14 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     with torch.cuda.amp.autocast(enabled=amp):
                         output = model(*get_inputs(sample))
-                        loss = model.nll(output, sample["label"])
+                        loss_nll = model.nll(output, sample["label"])
+                        loss_huber = F.smooth_l1_loss(output["pred"], sample["label"], beta=0.5)
+                        soft_usage = output["gates"].mean(dim=(0, 1))
+                        num_experts = soft_usage.numel()
+                        loss_balance = num_experts * soft_usage.square().sum() - 1.0
+                        loss = (loss_nll +
+                                args.aux_huber_weight * loss_huber +
+                                args.router_balance_weight * loss_balance)
                     if not torch.isfinite(loss):
                         raise RuntimeError(f"Nonfinite loss epoch={epoch+1}, step={steps+1}")
                     scaler.scale(loss).backward()
@@ -150,16 +183,24 @@ def main():
                     scaler.step(optimizer)
                     scaler.update()
                     total += loss.item()
+                    nll_total += loss_nll.item()
+                    huber_total += loss_huber.item()
+                    balance_total += loss_balance.item()
                     steps += 1
                     if args.max_steps and steps >= args.max_steps:
                         break
                 scheduler.step()
                 validation = evaluate(model, loaders["valid"], datasets["valid"], device, amp, args.seed)
                 peak = round(torch.cuda.max_memory_allocated() / 1024**3, 2) if device.type == "cuda" else None
-                log = {"epoch":epoch+1, "train_NLL":round(total/max(steps,1),5),
+                log = {"epoch":epoch+1, "train_NLL":round(nll_total/max(steps,1),5),
+                       "train_objective":round(total/max(steps,1),5),
+                       "train_Huber":round(huber_total/max(steps,1),5),
+                       "train_router_penalty":round(balance_total/max(steps,1),5),
                        "validation":validation, "peak_gpu_GiB":peak,
                        "seconds":round(time.monotonic()-start,1), "train_steps":steps,
-                       "expected_steps":len(loaders["train"]), "max_steps":args.max_steps}
+                       "expected_steps":len(loaders["train"]), "max_steps":args.max_steps,
+                       "logvar_floor":args.logvar_floor, "aux_huber_weight":args.aux_huber_weight,
+                       "router_balance_weight":args.router_balance_weight}
                 history.write(json.dumps(log, ensure_ascii=False) + "\n")
                 history.flush()
                 print(json.dumps(log, ensure_ascii=False))
@@ -169,6 +210,10 @@ def main():
                                 "audio_dim": ds.audio.shape[-1], "vision_dim":ds.vision.shape[-1],
                                 "epoch":epoch+1, "val_MAE":best}, output_dir/"best.pt")
         ckpt_path = output_dir/"best.pt"
+        if args.skip_test_after_training:
+            print("Validation-only experiment: final test set NOT evaluated.")
+            print(f"Best checkpoint: {ckpt_path}")
+            return
     else:
         if not args.checkpoint:
             raise ValueError("Provide --checkpoint path/to/best.pt for --mode eval")

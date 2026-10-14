@@ -65,8 +65,9 @@ class PaperQAMoE(nn.Module):
     choices and may differ from the authors' unreleased reference implementation.
     """
     def __init__(self, bert_path="bert-base-uncased", audio_dim=74, vision_dim=35,
-                 hidden=128, experts=8, top_k=3, dropout=0.1):
+                 hidden=128, experts=8, top_k=3, dropout=0.1, logvar_floor=None):
         super().__init__()
+        self.logvar_floor = logvar_floor
         self.bert = BertModel.from_pretrained(bert_path)
         self.text_projection = nn.Linear(self.bert.config.hidden_size, hidden)
         self.audio = SequentialEncoder(audio_dim, hidden, dropout)
@@ -115,8 +116,15 @@ class PaperQAMoE(nn.Module):
         refined = (reliability.unsqueeze(-1) * per_modality
                    + (1 - reliability).unsqueeze(-1) * self.global_prior)
         h = self.fuse(refined.reshape(batch, -1))
+        raw_log_var = self.logvar_head(h).squeeze(-1)
+        if self.logvar_floor is None:
+            log_var = raw_log_var.clamp(-10.0, 10.0)
+        else:
+            # Smooth lower bound: unlike clamp, gradients survive below the floor.
+            log_var = (self.logvar_floor +
+                       F.softplus(raw_log_var - self.logvar_floor)).clamp(max=10.0)
         return {"pred": self.pred_head(h).squeeze(-1),
-                "log_var": self.logvar_head(h).squeeze(-1).clamp(-10.0, 10.0),
+                "log_var": log_var,
                 "reliability": reliability, "mu": mu, "variance": var, "gates": gating}
 
     @staticmethod

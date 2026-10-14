@@ -55,7 +55,8 @@ def main():
     loader = DataLoader(ds,batch_size=args.batch_size,shuffle=False)
     bert_path = args.bert_path or opts.get("bert_path","bert-base-uncased")
     model = PaperQAMoE(bert_path, ds.audio.shape[-1], ds.vision.shape[-1],
-                       opts.get("hidden",128), opts.get("experts",8),opts.get("top_k",3)).to(device)
+                       opts.get("hidden",128), opts.get("experts",8),opts.get("top_k",3),
+                       logvar_floor=opts.get("logvar_floor")).to(device)
     model.load_state_dict(saved["state_dict"],strict=True)
     model.eval()
     pred, gold, logvar, r, gating = [], [], [], [], []
